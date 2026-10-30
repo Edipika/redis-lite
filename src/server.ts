@@ -1,9 +1,52 @@
 // server.ts — run with: node server.ts
+import fs from "node:fs";
 import net from "node:net";
-import { parseCommand, simple, error, integer, bulk, nullBulk } from "./resp.ts";
+import { parseCommand, simple, error, integer, bulk, nullBulk, encodeCommand } from "./resp.ts";
 
 const PORT = 6380;
+const AOF_FILE = "appendonly.aof";
+let aofFd = -1;
+let replaying = false;
 const store = new Map<string, string>();
+const expiries = new Map<string, number>();
+
+// Appends one command to the log file.
+function logCommand(args: string[]): void {
+  if (replaying) return;
+  fs.writeSync(aofFd, encodeCommand(args));
+}
+
+// If the key's deadline has passed, remove it from both maps.
+function removeIfExpired(key: string): void {
+  if (replaying) return;          
+  const expiresAt = expiries.get(key);
+  if (expiresAt !== undefined && expiresAt <= Date.now()) {
+    store.delete(key);
+    expiries.delete(key);
+  }
+}
+
+// Reads the file and runs every command again to rebuild the data.
+function replayAof(): void {
+  if (!fs.existsSync(AOF_FILE)) return;      // first run: nothing to replay
+
+  const data = fs.readFileSync(AOF_FILE);
+  let offset = 0;                            // how far into the file we are
+  let count = 0;
+
+  replaying = true;
+  while (offset < data.length) {
+    const result = parseCommand(data.subarray(offset));
+    if (!result) break;                      // incomplete command at the end
+    handle(result.args);                     // run it (no reply is needed)
+    offset += result.consumed;
+    count++;
+  }
+  replaying = false;
+
+  sweepExpired();
+  console.log(`AOF: replayed ${count} commands, ${store.size} keys loaded`);
+}
 
 // Turns one parsed command into a RESP reply string.
 
@@ -14,7 +57,7 @@ function handle(args: string[]): string {
   switch (name) {
     case "PING": {
       const [message] = rest;
-      return message !== undefined ? bulk(message) : simple("PONG");
+      return message !== undefined ? bulk(message) : simple("POONG");
     }
 
     case "SET": {
@@ -22,6 +65,8 @@ function handle(args: string[]): string {
       if (key === undefined || value === undefined)
         return error("ERR wrong number of arguments for 'set'");
       store.set(key, value);
+      expiries.delete(key);
+      logCommand(["SET", key, value]);
       return simple("OK");
     }
 
@@ -29,6 +74,7 @@ function handle(args: string[]): string {
       const [key] = rest;
       if (key === undefined || rest.length !== 1)
         return error("ERR wrong number of arguments for 'get'");
+      removeIfExpired(key);
       const value = store.get(key);
       return value === undefined ? nullBulk() : bulk(value);
     }
@@ -36,8 +82,47 @@ function handle(args: string[]): string {
     case "DEL": {
       if (rest.length === 0) return error("ERR wrong number of arguments for 'del'");
       let removed = 0;
-      for (const key of rest) if (store.delete(key)) removed++;
+      for (const key of rest) {
+        removeIfExpired(key);
+        if (store.delete(key)) removed++;
+        expiries.delete(key);
+      }
+      if (removed > 0) logCommand(["DEL", ...rest]);
       return integer(removed);
+    }
+
+    case "EXPIRE": {
+      const [key, secondsText] = rest;
+      if (key === undefined || secondsText === undefined || rest.length !== 2)
+        return error("ERR wrong number of arguments for 'expire'");
+
+      if (!/^-?\d+$/.test(secondsText))
+        return error("ERR value is not an integer or out of range");
+
+      const seconds = Number(secondsText);
+
+      removeIfExpired(key);
+      if (!store.has(key)) return integer(0);   // key doesn't exist
+      const deadline = Date.now() + seconds * 1000;
+      expiries.set(key, deadline);
+      logCommand(["PEXPIREAT", key, String(deadline)]);
+      return integer(1);                        // deadline saved
+    }
+
+    // PEXPIREAT key <unix time in ms> — sets an exact deadline.
+    case "PEXPIREAT": {
+      const [key, msText] = rest;
+      if (key === undefined || msText === undefined || rest.length !== 2)
+        return error("ERR wrong number of arguments for 'pexpireat'");
+      if (!/^-?\d+$/.test(msText))
+        return error("ERR value is not an integer or out of range");
+
+      removeIfExpired(key);
+      if (!store.has(key)) return integer(0);
+
+      expiries.set(key, Number(msText));
+      logCommand(["PEXPIREAT", key, msText]);
+      return integer(1);
     }
 
     // redis-cli sends this on connect; an empty reply keeps it happy.
@@ -74,17 +159,19 @@ const server = net.createServer((socket) => {
   socket.on("error", () => { }); // client disconnected abruptly; ignore
 });
 
+replayAof();                                  // 1. rebuild the data
+aofFd = fs.openSync(AOF_FILE, "a");    
 server.listen(PORT, () => console.log(`redis-lite listening on ${PORT}`));
 
+// Every second, delete keys whose deadline has passed (even if nobody reads them).
+function sweepExpired(): void {
+  const now = Date.now();
+  for (const [key, expiresAt] of expiries) {
+    if (expiresAt <= now) {
+      store.delete(key);
+      expiries.delete(key);
+    }
+  }
+}
 
-
-// Next step: Day 2, starting with EXPIRE. Here is the plan:
-
-// Add an expiry map. Next to store, add const expiries = new Map<string, number>();. It maps a key to the time (in milliseconds) when it should disappear.
-// Add the EXPIRE key seconds command. If the key doesn’t exist, reply integer(0). Otherwise save Date.now() + seconds * 1000 in expiries and reply integer(1). Check that seconds is a valid number.
-// Do lazy expiry in GET. Before reading a key, check whether it has an expiry time in the past. If so, delete it from both maps and treat it as missing.
-// Add a periodic sweep. Use setInterval every second to look through expiries and delete expired keys, so keys nobody reads don’t pile up.
-// Clean up in SET and DEL. A plain SET should remove any old expiry for that key, and DEL should remove it too.
-// Test it. Run set a 1, expire a 5, get a (returns "1"), wait 5 seconds, then get a (returns nil).
-
-// After that comes persistence, the append-only log that you replay when the server starts.
+setInterval(sweepExpired, 1000);

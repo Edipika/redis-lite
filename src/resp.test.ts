@@ -1,7 +1,7 @@
 // resp.test.ts — run with: node --test resp.test.ts
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parseCommand, bulk } from "./resp.ts";
+import { parseCommand, bulk,encodeCommand } from "./resp.ts";
 
 // Helper: build a RESP command the way redis-cli would send it.
 function encode(...args: string[]): Buffer {
@@ -47,4 +47,11 @@ test("non-ASCII values use byte length", () => {
 
 test("rejects garbage", () => {
   assert.throws(() => parseCommand(Buffer.from("hello\r\n")));
+});
+
+test("encodeCommand produces the client format", () => {
+  assert.equal(
+    encodeCommand(["SET", "foo", "bar"]),
+    "*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n"
+  );
 });

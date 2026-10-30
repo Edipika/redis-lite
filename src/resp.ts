@@ -68,3 +68,5 @@ export const error = (msg: string) => `-${msg}\r\n`;
 export const integer = (n: number) => `:${n}\r\n`;
 export const nullBulk = () => `$-1\r\n`;
 export const bulk = (s: string) => `$${Buffer.byteLength(s)}\r\n${s}\r\n`;
+export const encodeCommand = (args: string[]) =>
+  `*${args.length}\r\n` + args.map(bulk).join("");
